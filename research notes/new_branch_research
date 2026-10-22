@@ -1,0 +1,969 @@
+No files, branches, environments, datasets, or simulations were modified. This was a read-only investigation.
+
+## 1. Executive Summary
+
+**Recommended strategy:** create `feature/benchmark-integration` from **`origin/predicate-guide`**, but isolate benchmark adapters from the existing research-stage runtime. Start with dataset extraction, then GOAT/Habitat integration, then SOON/MatterSim integration.
+
+NeuroNav has a vendored C++/ROS 2 Hydra stack plus Python runtime adapters. `predicate-guide` adds a Habitat ROS bridge, world-snapshot representation, frontier scoring, and predicate-stage experiments. It is the strongest code base, but it does **not** prove an end-to-end GOAT or SOON pipeline works.
+
+The least-risk path is:
+
+```text
+official annotations → lossless JSONL extraction
+GOAT Habitat episode → RGB-D/pose/semantic adapter → Hydra → DSG snapshot
+DSG snapshot + task metadata → predicate scorer → candidate/action adapter
+SOON MatterSim viewpoint graph → discrete candidate/action adapter
+```
+
+## 2. Existing Branch Comparison
+
+| Branch | Hydra | Habitat | Predicate-guide | Runnable pipeline | Reusable components |
+|---|---|---:|---:|---:|---|
+| `origin/main` | Not found | Not found | Not found | Not found | Partial |
+| `origin/EvidencePDDL` | Verified | Partial | Partial | Partial | Verified |
+| `origin/predicate-guide` | Verified | Partial | Verified | Partial | Verified |
+| `origin/habitatmesh` | Verified | Partial | Not found | Partial | Verified |
+| `origin/hydra-handoff` | Verified | Partial | Not found | Partial | Verified |
+| `origin/frontier-exploration` | Partial | Partial | Not found | Partial | Partial |
+
+“Runnable pipeline” means runnable code/launch assets exist, not that I executed them or verified a complete closed loop.
+
+Evidence: `predicate-guide` contains `src/hydra`, `src/hydra_ros`, `src/neuronav_runtime`, Habitat bridge/worker files, frontier code, and numerous predicate stages. Its latest tip is `a5f892a6`; `habitatmesh` is `3ee9fd0b`; `hydra-handoff` is `e2f6e94f`.
+
+## 3. Existing NeuroNav Data Flow
+
+```text
+Habitat-Sim worker
+  ├─ RGB, depth, optional GT semantic images
+  ├─ agent pose / simulated time
+  └─ optional oracle/navmesh services
+          │ Unix socket
+          ▼
+HabitatLiveBridge (ROS 2)
+  ├─ sensor_msgs/Image RGB/depth/semantic
+  ├─ sensor_msgs/CameraInfo
+  ├─ nav_msgs/Odometry
+  ├─ TF world → base_link_gt → left_cam
+  └─ /clock
+          ▼
+hydra_ros image receiver
+  ├─ timestamp-synchronized RGB + depth (+ labels or features)
+  └─ Hydra input packet with world_T_body
+          ▼
+Hydra
+  ├─ reconstruction / mesh / freespace
+  ├─ places, frontiers, objects, rooms
+  └─ Dynamic Scene Graph
+          ▼
+dsg_snapshot / world_model
+  └─ WorldSnapshot: places, frontiers, objects, robot pose/place
+          ▼
+predicate belief + utility / stage-6 planner
+  └─ ranked frontier/cell or world action pose
+          ▼
+Habitat replanner / controlled executor / oracle path
+```
+
+**Verified from source:** the live bridge declares RGB, depth, semantic, odometry, camera-info, TF, and clock publishers in `origin/predicate-guide:src/neuronav_runtime/neuronav_runtime/habitat_live_bridge.py:60-72,241-264`. The Hydra MP3D launch remaps bridge outputs to Hydra inputs in `src/hydra_ros/hydra_ros/launch/datasets/mp3d_freespace_frontier.launch.py:129-147`.
+
+## 4. Hydra Interface Specification
+
+### Minimum simulator observation interface
+
+For the existing closed-set Hydra RGB-D route:
+
+- **Required**
+  - RGB `sensor_msgs/Image`
+  - Registered depth `sensor_msgs/Image`
+  - RGB camera calibration `sensor_msgs/CameraInfo`
+  - Timestamped body pose through TF / odometry
+  - Stable frame tree matching configured `odom`, robot, and camera frames
+  - Semantic label image for the closed-set receiver, or an external open-set transaction route.
+
+- **Optional / configuration dependent**
+  - Feature image for the open-set receiver
+  - GT semantic image
+  - IMU and LiDAR: not required by the shown Habitat RGB-D path
+  - Oracle navigation, scene query, TSDF coverage exports.
+
+The standard receiver synchronizes RGB, depth, and semantics approximately by timestamp; its RGB-D-only variant synchronizes just RGB/depth. See `image_receiver.h:123-183,201-231`.
+
+### Data/frames
+
+- Hydra `InputPacket` needs `timestamp_ns`, sensor input, `world_t_body`, and `world_R_body`: `src/hydra/include/hydra/input/input_packet.h:45-60`.
+- The Habitat adapter defines Habitat as Y-up, default forward `-Z`; its ROS-like world is Z-up, X-forward: `habitat_common.py:27-43`.
+- Default simulator camera geometry is 640×480, 90° HFOV; intrinsics are computed in `habitat_common.py:192-207`.
+- The bridge publishes `world`, `base_link_gt`, and `left_cam` by default: `habitat_live_bridge.py:69-71`.
+- Exact depth units must be validated against the ROS image conversion configuration at runtime; the bridge itself forwards Habitat depth arrays and does not establish a benchmark-specific unit contract in the inspected source.
+
+### Hydra outputs consumed by NeuroNav
+
+`WorldSnapshot` carries:
+
+- graph revision, frame id, timestamp
+- places: ID, position, graph neighbors, room
+- frontiers: ID, position, anchor place, voxel count
+- objects: ID, labels, positions, parent place/room, semantic evidence
+- robot pose and robot place ID.
+
+Evidence: `world_model.py:23-90,175-213`. DSG extraction recognizes object/place/mesh-place/room layers in `dsg_snapshot.py:29-34`.
+
+## 5. Existing Habitat Integration
+
+**Verified from source**
+
+- `HabitatWorker` instantiates Habitat-Sim through `make_habitat_sim`, gets sensor observations, and checks a loaded navmesh: `habitat_worker.py:116-136,184-213`.
+- It captures RGB, depth, and optionally Habitat GT semantic observations: `habitat_worker.py:184-212`.
+- The current worker selects a random navigable starting position; it does not load official GOAT episodes: `habitat_worker.py:164-168`.
+- A ROS bridge transports the worker output and exposes command/oracle mechanisms.
+- The MP3D Hydra launch uses `mp3d_freespace_frontier`, maps the bridge’s simulated topics, and optionally exposes scene query: `mp3d_freespace_frontier.launch.py:50-100,129-151`.
+
+**Missing / requires implementation**
+
+- GOAT episode parsing and initialization from official start poses.
+- GOAT sequential-goal execution and official success accounting.
+- SOON JSON parsing, MatterSim episode initialization, and official evaluation.
+- Proven full closed-loop benchmark execution.
+- A tested adapter from predicate action to either official GOAT actions or SOON viewpoint transitions.
+
+The stage-6 launch is deliberately limited to the replanner and requires bridge/Hydra/preflight externally; this is explicit in `predicate_newstage6_online.launch.py:1-6,16-34`. Therefore snapshot replay/shadow tests must not be presented as live mapping evidence.
+
+## 6. Predicate-Guide Interface
+
+**Task interface — verified**
+
+The initial task protocol is narrow and manually specified: `"Find a chair near the observed table."`, target `chair`, anchor `table`, relation `near_2m_same_region`; it is not an arbitrary-language parser. See `predicate_episode_core.py:18-36`.
+
+The relation is evaluated from GT-like object AABBs, region identity, 2 m planar gap, and 0.5 m bottom-height tolerance: `predicate_episode_core.py:54-151`.
+
+Supported operational predicates are primarily entity existence plus `Near(entity_a, entity_b)`. This is a research protocol, not a general semantic parser.
+
+**Scene-graph contract — verified**
+
+Utility scoring accepts:
+
+```text
+PredicateBelief + WorldSnapshot + frontier evidence
+→ UtilityScoreResult
+```
+
+A candidate action represents a map cell with member/representative frontier IDs, anchor place ID, voxel count, and graph distances: `predicate_utility_core.py:55-119,263-280`.
+
+**Actions and cost**
+
+- Output is a ranked projected map-cell/frontier action, not directly a SOON viewpoint ID.
+- Cost is based on place-graph Dijkstra distance.
+- The utility module is explicitly controller-disabled and has no ROS, Habitat, Nav2, GT, or controller dependency: `predicate_utility_core.py:1-8,137-153`.
+
+**Compatibility**
+
+- Simulator-independent: `world_model`, belief, relation grounding, utility scoring, JSON contracts.
+- Habitat-dependent: bridge, worker, replanners, navmesh/oracle execution.
+- Continuous-navigation assumptions: Hydra frontiers and geometric world-goal execution.
+- SOON adaptation: feasible only through a candidate/action translation layer.
+
+## 7. GOAT-Bench Feasibility
+
+| Component | Assessment |
+|---|---|
+| Dataset access | Adapter required |
+| Description extraction | Adapter required |
+| RGB/depth/pose | Adapter required |
+| Hydra integration | Adapter required |
+| Scene graph generation | Adapter required |
+| Predicate grounding | Major modification |
+| Exploration/action execution | Major modification |
+| Official GOAT evaluation | Adapter required |
+| Full closed-loop pipeline | Unknown / requires testing |
+
+**Supported by official documentation:** GOAT uses Habitat-Sim `0.2.3`, Habitat-Lab `v0.2.3`, Python `3.7` in its documented environment; uses HM3D assets and splits `train`, `val_seen`, `val_seen_synonyms`, `val_unseen`; official evaluation invokes `python -um goat_bench.run --run-type eval`. [GOAT README](https://github.com/Ram81/goat-bench/blob/main/README.md)
+
+GOAT is the better first simulator target because NeuroNav already has a Habitat-Sim worker, MP3D-style RGB-D bridge, TF convention, and Hydra launch. It still needs an episode-aware replacement or extension of the current random-start Habitat worker.
+
+GOAT’s task sequence may contain category, language, and image goals. Only original language fields should become description records; category-only/image-only subtasks must remain explicitly non-linguistic.
+
+## 8. SOON Feasibility
+
+| Component | Assessment |
+|---|---|
+| Dataset access | Adapter required |
+| Task extraction | Adapter required |
+| RGB | Adapter required |
+| Depth | Adapter required |
+| Camera poses | Adapter required |
+| Hydra integration | Major modification |
+| Scene graph generation | Major modification |
+| Predicate grounding | Major modification |
+| Candidate/action execution | Major modification |
+| Closed-loop exploration | Major modification |
+| Official evaluation | Adapter required |
+
+**Supported by official documentation:** FAO provides `train.json`, `val_unseen_instrs.json`, `val_unseen_house.json`, and `test.json`. [Official SOON page](https://scenario-oriented-object-navigation.github.io/)
+
+MatterSim is viewpoint-graph navigation, not continuous navigation:
+
+- state includes a scan ID, viewpoint and navigable neighbors;
+- actions select a neighbor index and alter heading/elevation;
+- RGB is available; depth exists only when enabled and uses z-depth, with raw values divided by 4000 for metres;
+- viewpoints are sparse, on average about 2.25 m apart;
+- camera heading/elevation can change at a viewpoint.
+
+[Official Matterport3D Simulator README](https://github.com/peteanderson80/Matterport3DSimulator/blob/master/README.md)
+
+The graph is normally exposed through `navigableLocations`; whether it is “known” to the policy depends on what the adapter reveals. Do not expose complete connectivity if evaluating under an unknown-environment assumption.
+
+### SOON action options
+
+| Option | Change effort | Fidelity to predicate exploration |
+|---|---|---|
+| A. Score valid MatterSim viewpoints directly | Lower | Lower; replaces continuous frontiers with sparse graph nodes |
+| B. Select Hydra frontier, project/snap to reachable viewpoints | Higher | Higher, but fragile |
+
+Recommendation: begin with **A** for a valid runnable prototype. Move to **B** only after establishing depth/pose reconstruction and reachability projection.
+
+### Continuous SOON in Habitat
+
+| Requirement | Original SOON + MatterSim | Adapted SOON + Habitat |
+|---|---|---|
+| Official compatibility | Verified | Not official |
+| Hydra compatibility | Major modification | Adapter required |
+| Geometric exploration | Sparse viewpoints | Stronger continuous support |
+| Implementation complexity | Lower for official scoring | Lower for Hydra, higher for benchmark fidelity |
+| Evaluation comparability | Official | Requires a separately declared protocol |
+
+Using the same MP3D scenes in Habitat does not reproduce SOON: start viewpoints, discrete transitions, rendered observations, target localization, and official success conditions all need redefinition or exact conversion. This is a **reasonable inference**, not verified equivalence.
+
+## 9. Dataset Extraction Plan
+
+Extraction does not require either simulator once official annotation files are available.
+
+Suggested lossless JSONL schema:
+
+```json
+{
+  "benchmark": "goat|soon",
+  "split": "official split name",
+  "source_file": "relative original annotation path",
+  "source_record_index": 0,
+  "episode_id": "original value or null",
+  "subtask_id": "original value or null",
+  "subtask_index": 0,
+  "scene_id": "original value or null",
+  "goal_type": "language|category|image|unknown",
+  "description_original": "verbatim string or null",
+  "description_components_original": {},
+  "start": {"position": null, "rotation": null, "viewpoint_id": null, "heading": null},
+  "target_metadata_official": {},
+  "ground_truth_official": {},
+  "derived": {}
+}
+```
+
+Rules:
+
+- Store every source string byte-for-byte after JSON decoding; never normalize, translate, merge, or paraphrase.
+- Emit one row per GOAT sequential subtask and retain its sequence index.
+- Preserve SOON components separately if source JSON has separate object/relationship/region/nearby-region fields; retain any original combined description independently.
+- Use `null` for unavailable data; never synthesize descriptions for image/category goals.
+- Preserve whole official target structures under `target_metadata_official`.
+- Validate: source-row count, unique key `(benchmark, split, episode_id, subtask_id/index)`, exact raw-string round trip, source-file provenance, and split totals.
+
+**Unknown:** exact GOAT and SOON JSON field names must be established by inspecting the downloaded official annotations. Neither dataset is locally available in this worktree.
+
+## 10. Recommended Base Branch
+
+Choose **`origin/predicate-guide`**.
+
+Reasoning:
+
+- It contains the vendored Hydra/Hydra ROS stack.
+- It contains the live Habitat bridge/worker, frame conversion, RGB-D publishing, MP3D Hydra launch, DSG snapshots, predicate belief, scoring, and action-stage experiments.
+- The other inspected branches contain subsets or earlier handoff/mesh work.
+- Starting there minimizes duplicate adapter infrastructure.
+
+Risk: it is research-stage and operationally coupled to specific MP3D/Habitat ROS experiments. New benchmark code must be cleanly separated to avoid importing stage-specific assumptions.
+
+## 11. Proposed Directory Structure
+
+```text
+benchmarks/
+  common/
+    task_record.py
+    coordinate_frames.py
+    hydra_observation_adapter.py
+    action_contract.py
+  goat/
+    dataset.py
+    habitat_episode_adapter.py
+    evaluation_adapter.py
+  soon/
+    dataset.py
+    mattersim_episode_adapter.py
+    viewpoint_graph_adapter.py
+    evaluation_adapter.py
+  extractors/
+    goat_jsonl.py
+    soon_jsonl.py
+    validate_jsonl.py
+  scripts/
+    extract_goat_tasks
+    extract_soon_tasks
+    run_goat_episode
+    run_soon_episode
+  tests/
+    test_goat_extraction.py
+    test_soon_extraction.py
+    test_hydra_observation_contract.py
+    test_soon_action_adapter.py
+```
+
+Reuse:
+
+- `src/neuronav_runtime/neuronav_runtime/habitat_common.py`
+- `habitat_live_bridge.py`
+- `world_model.py`
+- `dsg_snapshot.py`
+- predicate core modules
+- Hydra’s existing ROS image receiver and MP3D launch patterns.
+
+Do not copy GOAT, SOON, Habitat-Lab, or MatterSim into NeuroNav.
+
+## 12. Implementation Roadmap
+
+| Milestone | Deliverable / acceptance criterion |
+|---|---|
+| 1. Extraction | GOAT/SOON JSONL with original descriptions, IDs, split, source paths, target metadata; count and exact-text validation |
+| 2. GOAT simulator | One official GOAT episode initializes at its official pose, produces observations, and executes no-op/basic official actions |
+| 3. GOAT + Hydra | Timestamped observations produce a non-empty Hydra/DSG update with documented frames |
+| 4. SOON simulator | One official FAO record initializes in MatterSim at its official viewpoint/heading and exposes neighbors/RGB/depth when enabled |
+| 5. SOON + Hydra | A calibrated MatterSim RGB-D/pose adapter produces validated Hydra inputs and a DSG update |
+| 6. Predicate-guide | Task conversion plus snapshot input produces a candidate; GOAT action or SOON viewpoint action executes with traceable provenance |
+| 7. Evaluation/docs | Reproducible scripts, dependency manifests, evaluation adapters, tests, and explicit official-vs-adapted protocol documentation |
+
+Dependencies: 3 depends on 2; 5 depends on 4; 6 depends on a verified scene-graph contract from 3 or 5. Main blockers are asset access, dependency-version conflicts, depth/frame calibration, and target-success equivalence.
+
+## 13. Technical Risks
+
+1. **High — SOON discrete vs. Hydra continuous geometry.** Begin with graph-node candidates; document loss of continuous-frontier behavior.
+2. **High — official benchmark validity.** A Habitat port of SOON is a new protocol, not official SOON.
+3. **High — semantic representation.** GOAT/SOON language is richer than the current manually fixed chair/table relation protocol.
+4. **Medium — simulator dependency conflicts.** GOAT’s documented Habitat 0.2.3/Python 3.7 differs from NeuroNav’s checked-in Habitat environment specifying Python 3.9.
+5. **Medium — coordinate/depth calibration.** Prove pixel-depth-to-world consistency before mapping claims.
+6. **Medium — existing experiment maturity.** Existing launch/script presence is not end-to-end validation.
+
+## 14. Immediate Next Steps
+
+1. Create `feature/benchmark-integration` from `origin/predicate-guide`.
+2. Download only official annotation archives first; implement and validate lossless JSONL extraction.
+3. Inspect exact GOAT episode schema and add a read-only schema fixture/test.
+4. Make the Habitat worker accept an explicit GOAT scene/start pose before adding goals or evaluation.
+5. Build a SOON parser and MatterSim viewpoint action contract before attempting Hydra conversion.
+
+## 15. Evidence and Confidence
+
+- **Verified from source:** Hydra is vendored under `src/hydra`; its local `.gitmodules` is empty, so it is not represented as a Git submodule in the inspected branch.
+- **Verified from source:** `predicate-guide` contains a real ROS/Habitat bridge and worker, but starts randomly rather than from benchmark episodes (`habitat_worker.py:164-168`).
+- **Verified from source:** the world snapshot and predicate utility contracts are independent Python data structures; utility scoring is controller-disabled (`predicate_utility_core.py:1-8`).
+- **Supported by documentation:** GOAT’s documented Habitat versions, environment layout, dataset split names, and eval entry point are from the [official README](https://github.com/Ram81/goat-bench/blob/main/README.md).
+- **Supported by documentation:** SOON split files are named on the [official SOON page](https://scenario-oriented-object-navigation.github.io/); MatterSim action/depth behavior is documented in the [official simulator README](https://github.com/peteanderson80/Matterport3DSimulator/blob/master/README.md).
+- **Unknown / requires testing:** any claim that existing NeuroNav runs full GOAT, full SOON, closed-loop Hydra mapping, or official success evaluation.
+
+
+
+
+## 1. Git branch history diagram
+
+The fetched repository is shallow/grafted: each remote branch tip is marked `grafted`, and `git merge-base` produced no shared commit for the examined cross-branch pairs. Therefore exact origin, merge, and ancestor claims cannot be reconstructed from this local clone.
+
+```text
+Verified refs available locally
+
+origin/main                         37c1210d  2026-03-17
+origin/feature/vln-pddl-parser      d6a8fa84  2026-04-22
+origin/frontier-exploration         d941ac8f  2026-04-26
+origin/hydra-handoff                e2f6e94f  2026-05-10
+origin/openset_clip                 5ce83ffe  2026-06-22
+origin/CEDN                         d96efa8a  2026-07-26
+origin/FastSAM                      a7b76767  2026-07-27
+origin/merge_space                  1ac6da4f  2026-07-30
+origin/habitatmesh                  3ee9fd0b  2026-08-10
+origin/EvidencePDDL                 e1d4099a  2026-08-12
+origin/predicate-guide              a5f892a6  2026-10-18
+                                      │
+                                      └─ feature/benchmark-integration
+                                         a5f892a6 (exactly same commit)
+```
+
+**Verified Git fact:** `feature/benchmark-integration` has no unique commit; it exactly equals `origin/predicate-guide` at `a5f892a6`.
+
+**Unknown:** whether the listed remote branches are direct descendants of one another, whether they were merged, or their true common ancestor. A non-shallow clone or access to fuller history is needed.
+
+## 2. Branch overview
+
+| Branch | Latest commit | Main purpose / actual contents | Status |
+|---|---|---|---|
+| `main` | `37c1210d` | Docker environment setup only in the visible tree. | Minimal / superseded in practice |
+| `feature/vln-pddl-parser` | `d6a8fa84` | Early scene-graph-to-PDDL utilities: `sg_to_pddl.py`, goal/action/PDDL assembler/executor. | Prototype, no visible runtime tests |
+| `frontier-exploration` | `d941ac8f` | MP3D Habitat bridge/worker plus frontier explorer. | Partial runnable experiment infrastructure |
+| `hydra-handoff` | `e2f6e94f` | Hydra-to-world-snapshot/PDDL/task-executive handoff. | Partial; unit tests exist |
+| `openset_clip` | `5ce83ffe` | CLIP/open-set perception and RGB debug overlay. | Partial integration |
+| `CEDN` | `d96efa8a` | Evidence-centric detection/navigation, open-set perception, reproducibility assets. | Extensive experimental code/tests |
+| `FastSAM` | `a7b76767` | FastSAM/open-set task validation and long-range recording evidence. | Experimental perception branch |
+| `merge_space` | `1ac6da4f` | Broad runtime consolidation through Stage 48, including navigation/TF work. | Extensive experimental runtime |
+| `EvidencePDDL` | `e1d4099a` | Evidence-backed symbolic planning, object evidence, PDDL control, open-set integration. | Extensive experimental runtime |
+| `habitatmesh` | `3ee9fd0b` | Habitat oracle/navigation, mesh/frontier runtime, target verification. | Most mature pre-predicate execution evidence |
+| `predicate-guide` | `a5f892a6` | Predicate-conditioned candidate generation, belief, relation grounding, Stage 1–6 experiments. | Most mature predicate research branch |
+| `feature/benchmark-integration` | `a5f892a6` | Exact snapshot of `predicate-guide`; no benchmark code yet. | Clean starting point |
+
+## 3. Detailed implementation status
+
+### `main`
+
+- **Verified:** only `env_setup/` appears in its root tree.
+- **Purpose:** baseline environment setup.
+- **GOAT/SOON value:** effectively none beyond historical Docker setup.
+- **Missing:** Hydra, ROS runtime, Habitat bridge, benchmark loaders, tests.
+
+### `feature/vln-pddl-parser`
+
+- **Verified modules:** `vln_planner/scene_graph_parser/{sg_to_pddl,goal_generator,action_grounding,pddl_assembler,planner_executor,interactive_pipeline}.py`.
+- **Purpose:** convert static scene-graph information into PDDL-oriented task representations.
+- **Status:** prototype/library layer. No Habitat worker, ROS pipeline, or visible test suite.
+- **GOAT/SOON value:** reusable conceptual task/PDDL utilities, but not an observation adapter.
+
+### `frontier-exploration`
+
+- **Verified modules:** `frontier_explorer.py`, `habitat_common.py`, `habitat_live_bridge.py`, `habitat_worker.py`.
+- **Purpose:** bridge MP3D Habitat observations to ROS/Hydra and explore frontiers.
+- **Status:** partial runtime. The tip message is “Make MP3D frontier launch self-contained.”
+- **GOAT/SOON value:** earliest reusable Habitat/ROS/frontier foundation.
+
+### `hydra-handoff`
+
+- **Verified modules:** `dsg_snapshot.py`, `world_model.py`, `dsg_domain_updater.py`, `pddl_brain.py`, `task_executive.py`, `task_state_machine.py`.
+- **Verified tests:** `test_world_snapshot_adapter.py`, `test_task_state_machine.py`, `test_topological_planner.py`, `test_stage5_mock_mode_switching.py`.
+- **Purpose:** consume a Hydra DSG as a stable planning snapshot and hand planning outputs toward task execution.
+- **Status:** implemented interfaces with tests; not proof of a live benchmark pipeline.
+- **GOAT/SOON value:** world snapshot, DSG extraction, task-state patterns.
+
+### `openset_clip`, `CEDN`, `FastSAM`
+
+- **Verified shared direction:** open-vocabulary perception, object mapping, evidence management, and recorded validation.
+- **Key documents:** `docs/open_set_perception_contract.md`, `docs/open_set_object_mapping.md`, `docs/open_set_tracking.md`.
+- **`openset_clip`:** explicitly adds CLIP evidence and RGB debugging by commit message.
+- **`CEDN`:** adds reproducible experiment delivery by commit message, with 48 test files in the visible tree.
+- **`FastSAM`:** contains `docs/fastsam_open_set_task_validation.md` and commit message “add long-range open-set task recording.”
+- **Status:** perception experiments, not benchmark adapters.
+
+### `merge_space`
+
+- **Verified:** 27 predicate-named files, Habitat bridge files, extensive Stage 16–48 summaries.
+- **Purpose:** broad integration of mapping, exploration, target verification, navigation, and runtime contracts.
+- **Status:** substantial experimental runtime, but not a confirmed merge ancestor of current predicate-guide.
+- **GOAT/SOON value:** potentially useful execution, TF, and navigation contracts; compare individual files before importing anything.
+
+### `EvidencePDDL`
+
+- **Verified documents:** `docs/evidence_rule_controller.md`, `docs/plan_evidence_manifest.md`, `docs/predicate_evidence_ledger.md`.
+- **Verified tree:** 62 tests, 22 predicate-related files, 6 Habitat bridge/runtime files.
+- **Purpose:** tie perception evidence and predicate ledger state to PDDL/task execution.
+- **Status:** broad experimental implementation. Tip is `fix: match modified DAM identities`.
+- **GOAT/SOON value:** evidence/PDDL interfaces may be reusable, but predicate-guide already contains later predicate-specific work.
+
+### `habitatmesh`
+
+- **Verified:** 40 tests, seven Habitat-related files, Stage 16–61 summaries and preserved live-run evidence.
+- **Purpose:** Habitat mapping/navigation/verification closure, including oracle navigation.
+- **Strongest evidence:** `summary/stage61_manual_demo_success.md` records one live privileged Habitat GT + NavMesh Oracle run ending in `DONE`.
+- **Boundary:** the report explicitly calls it one run, an upper bound, not repeatability, Nav2 validation, real-robot evidence, or natural discovery.
+- **GOAT/SOON value:** strongest known source of Habitat execution/verification mechanics.
+
+### `predicate-guide`
+
+- **Verified modules:** 570 predicate-named files and 84 tests in the branch tree.
+- **Core files:**
+  - `predicate_belief_core.py`
+  - `predicate_entity_identity_core.py`
+  - `predicate_relation_grounding_core.py`
+  - `predicate_newstage6_core.py`
+  - `predicate_newstage6_online_core.py`
+  - `predicate_newstage6_online_replanner.py`
+  - `predicate_utility_core.py`
+  - `world_model.py`
+  - `dsg_snapshot.py`
+- **Purpose:** task-predicate-conditioned exploration from scene-graph snapshots through scoring, Habitat execution, and replanning.
+- **Current semantic boundary:** fixed chair/table `Near` task, not arbitrary natural-language task compilation.
+- **Execution boundary:** historical natural cases use Habitat GT closed-set semantics and privileged NavMesh; merged open-set front end is not naturally revalidated.
+
+The branch’s own current-status report is unusually clear:
+
+- `summary/project_status_20261006.md`
+- `summary/neuronav_handoff_20261006.md`
+
+It states that natural runs exist, but no claim of general success, baseline improvement, robust repetition, arbitrary language, or open-set end-to-end validation should be made.
+
+## 4. Component comparison matrix
+
+Legend: I = implemented code exists; P = partial/prototype; A = absent from inspected tree; U = unknown.
+
+| Component | main | vln-pddl | frontier | handoff | open/cedn/fastsam | merge | EvidencePDDL | habitatmesh | predicate-guide |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Hydra core / ROS 2 | A | A | I | I | I | I | I | I | I |
+| Habitat-Sim worker/bridge | A | A | I | I | I | I | I | I | I |
+| RGB-D / camera TF | A | A | I | I | I | I | I | I | I |
+| Scene graph snapshots | A | P | P | I | I | I | I | I | I |
+| Open-vocabulary perception | A | A | A | A | I | I | I | P | I |
+| CLIP / FastSAM | A | A | A | A | I | P | I | P | I |
+| Tracking / semantic mapping | A | A | A | P | I | I | I | I | I |
+| Natural-language parsing | A | P | A | P | P | P | P | P | P |
+| PDDL generation/planning | A | I | P | I | I | I | I | I | P |
+| Predicate ledger/belief | A | A | A | P | P | P | I | P | I |
+| Frontier extraction/scoring | A | A | I | I | I | I | I | I | I |
+| Predicate-guided exploration | A | A | A | A | A | P | P | P | I |
+| Relation grounding | A | A | A | A | P | P | P | P | I |
+| Nav2 / action execution | A | A | P | P | I | I | I | I | I |
+| Online replanning | A | A | P | P | P | I | I | I | I |
+| Target verification | A | A | A | P | I | I | I | I | I |
+| Automated tests | A | A | A | I | I | I | I | I | I |
+| GOAT/SOON loader/eval | A | A | A | A | A | A | A | A | A |
+
+No branch contains verified GOAT-Bench or SOON dataset loaders/evaluation adapters.
+
+## 5. Predicate-guide development progression
+
+The strongest documented stage sequence is in `summary/neuronav_handoff_20261006.md`.
+
+| Stage | Added capability | Evidence level |
+|---|---|---|
+| Newstage 1 | Minimal predicate state from scene graph | Implemented/tested |
+| Newstage 2 | Auditable shadow joint-utility scorer | Offline/shadow |
+| Newstage 3 | Top-1 execution and replan after first binding | Limited natural runs |
+| Newstage 4 | Stable identity association and two-entity orchestration | Repairs/diagnostics; incomplete robustness |
+| 4-D/E/F | Pose projection, history, NavMesh precheck, movement safety | Implemented; coverage varies |
+| Newstage 5 | Relation interface, later simplified to AABB-only | Implemented |
+| Newstage 5-F | AABB relation plus macro closed-loop examples | Limited natural case |
+| Newstage 6 | Local observation actions, coverage scoring, execution interface | Implemented; latest open-set mode unvalidated |
+| TF/budget repairs | Bounded recovery, timing and budget safety | Controlled tests; no later natural batch |
+
+The report records Stage-6 closed-set natural results of one grounded relation run and two failures. It explicitly says that this cannot estimate general success or open-set performance.
+
+## 6. Key branch differences
+
+### `EvidencePDDL` vs `predicate-guide`
+
+- `EvidencePDDL`: evidence ledger, evidence-rule control, PDDL-oriented runtime, DAM identity updates.
+- `predicate-guide`: later predicate-specific belief, identity, geometric relation, local viewpoint scoring, and Stage-6 online orchestration.
+- **Verified code similarity:** both contain the broad Hydra/Habitat/runtime stack.
+- **Unverified ancestry:** local shallow history cannot prove `predicate-guide` contains `EvidencePDDL` commits.
+- **Practical conclusion:** do not merge wholesale; compare specific modules if benchmark work needs evidence/PDDL capability.
+
+### `habitatmesh` vs `predicate-guide`
+
+- `habitatmesh`: stronger preserved Habitat execution/target-verification closure evidence.
+- `predicate-guide`: stronger predicate-conditioned exploration implementation.
+- `predicate-guide`’s handoff claims merged open-set frontend work, but that is a code/documentation statement rather than ancestry proof.
+- **Practical conclusion:** benchmark branch already inherits predicate-guide’s runtime; only selectively port missing Habitatmesh functionality after file-level comparison.
+
+### `hydra-handoff` vs `predicate-guide`
+
+- `hydra-handoff`: earlier DSG snapshot → PDDL/task-executive bridge.
+- `predicate-guide`: retains/extends snapshot and world model concepts while adding predicate exploration stages.
+- `hydra-handoff` is useful as an architectural reference, not a base branch.
+
+### `main` vs all research branches
+
+- `main` is dramatically behind the research runtime visible in every later branch.
+- It should not be used as a benchmark integration base.
+
+## 7. Current NeuroNav architecture
+
+```text
+Existing integrated experimental runtime
+─────────────────────────────────────
+Habitat worker / bridge
+  → RGB-D, semantic data, odometry, TF, /clock
+  → Hydra ROS
+  → Hydra DSG: objects, places, rooms, frontiers
+  → DSG snapshot / WorldSnapshot
+  → task, evidence, frontier, target, or predicate runtime
+  → Habitat oracle / Nav2-related execution components
+
+Experimental predicate path
+───────────────────────────
+WorldSnapshot + fixed chair/table task
+  → stable identity / predicate belief
+  → generic + local observation candidates
+  → coverage / utility scoring
+  → privileged Habitat NavMesh feasibility/execution
+  → new observations / DSG update / replan
+  → AABB Near relation confirmation
+
+Research proposals / incomplete integration
+──────────────────────────────────────────
+Arbitrary natural-language → predicates
+GOAT episode loading/evaluation
+SOON JSON + MatterSim graph integration
+GOAT/SOON official success evaluation
+Validated open-set natural predicate closure
+```
+
+## 8. Most mature subsystem by evidence
+
+| Subsystem | Best branch | Evidence |
+|---|---|---|
+| Hydra mapping / ROS | `predicate-guide` | Vendored Hydra/Hydra ROS plus latest runtime |
+| Habitat simulation | `habitatmesh` / `predicate-guide` | Bridge/worker in both; habitatmesh has preserved Stage-61 live evidence |
+| Open-vocabulary perception | `CEDN` / `EvidencePDDL` | Open-set docs, modules, many tests; predicate-guide says merged frontend |
+| PDDL planning | `EvidencePDDL` | Evidence/PDDL docs and runtime modules |
+| Predicate evidence | `predicate-guide` | Belief, identity, relation, Stage 1–6 modules |
+| Frontier exploration | `frontier-exploration` historically; `predicate-guide` currently | Original focused branch vs later consolidated code |
+| Predicate-guided exploration | `predicate-guide` | `predicate_newstage*`, 84 tests, handoff/status reports |
+| Target verification | `habitatmesh` | Stage-61 preserved live upper-bound completion |
+| Online replanning | `predicate-guide` | `predicate_newstage6_online_*` modules and current handoff |
+
+“Most mature” does not mean generally validated or benchmark-ready.
+
+## 9. What `feature/benchmark-integration` inherits
+
+Exactly everything in `origin/predicate-guide:a5f892a6`, including:
+
+- Hydra/Hydra ROS stack.
+- Habitat worker and ROS bridge.
+- MP3D-oriented scene handling.
+- RGB-D, semantic, TF, clock, odometry interfaces.
+- DSG/world snapshot contract.
+- Frontier, target verification, PDDL-related legacy components.
+- Predicate belief, scoring, identity and relation-grounding modules.
+- Stage-6 predicate exploration runtime.
+- Open-set perception code and tests.
+
+It does **not** inherit an implemented GOAT/SOON adapter merely because it has Habitat or MP3D code.
+
+## 10. Missing for GOAT/SOON
+
+1. Official GOAT annotation parser and lossless description/target extractor.
+2. Official SOON/FAO annotation parser and lossless description-component extractor.
+3. GOAT episode start-pose, sequential-subtask, and success adapter.
+4. MatterSim initialization, viewpoint pose conversion, RGB/depth calibration, and discrete action adapter.
+5. A task compiler from arbitrary GOAT/SOON descriptions to the currently fixed predicate contract.
+6. A benchmark-neutral simulator observation/action interface.
+7. Official evaluation adapters and split-aware launch scripts.
+8. Tests against official annotation fixtures.
+9. A declared policy for category-only/image-only GOAT goals.
+10. A separately documented protocol if SOON is ported to Habitat rather than run in MatterSim.
+
+## 11. Recommended development strategy
+
+Keep `feature/benchmark-integration` based on `predicate-guide`.
+
+1. Add no runtime coupling first: implement dataset extraction and exact-text JSONL validation.
+2. Define `benchmarks/common` contracts for episode metadata, observations, poses, candidate actions, and outcomes.
+3. Adapt GOAT first because its Habitat stack is closest to current NeuroNav.
+4. Verify one GOAT episode’s RGB-D/pose → Hydra DSG pipeline before predicate integration.
+5. Build SOON as a native MatterSim discrete-graph adapter; initially score valid viewpoints directly.
+6. Keep official SOON and any Habitat-ported SOON experiments separate.
+7. Reuse existing code selectively, with file-level comparison against `habitatmesh` and `EvidencePDDL`; do not merge historical branches wholesale.
+8. Treat predicate-guide’s open-set and natural-run results as research evidence with stated boundaries, not as benchmark-ready infrastructure.
+
+The key audit finding is that `predicate-guide` is the most capable current baseline, while the repository’s shallow history prevents a trustworthy claim that it ancestrally contains or merges the other research branches.
+
+
+
+| Branch | Main purpose | What was developed | Current status |
+|---|---|---|---|
+| `main` | Environment setup | Docker/environment configuration | Minimal |
+| `feature/vln-pddl-parser` | Language/task planning | Scene graph → PDDL conversion, goal generation, symbolic planning | Early prototype |
+| `frontier-exploration` | Robot exploration | Habitat simulator bridge, Hydra frontiers, frontier exploration | Partial runtime |
+| `hydra-handoff` | Connect mapping to planning | Hydra scene graph → world snapshot → PDDL/task executive | Implemented interfaces and tests |
+| `openset_clip` | Open-vocabulary perception | CLIP integration and visual debugging | Partial integration |
+| `CEDN` | Evidence-based perception/navigation | Object detection, evidence tracking, semantic mapping | Extensive experimental implementation |
+| `FastSAM` | Object segmentation | FastSAM integration and open-set validation | Experimental |
+| `merge_space` | System integration | Mapping, exploration, navigation, verification, runtime consolidation | Extensive experimental runtime |
+| `EvidencePDDL` | Evidence-backed task planning | Predicate ledger, PDDL reasoning, evidence-based control | Extensive experimental runtime |
+| `habitatmesh` | Habitat navigation and verification | Mesh/frontier navigation, oracle execution, target verification | Strongest documented earlier execution result |
+| **`predicate-guide`** | **Qibin's research method** | Predicate belief, geometric relations, exploration utility, online replanning | **Most developed predicate research branch** |
+| **Your branch** | **Benchmark integration** | Currently identical to `predicate-guide` | No new implementation yet |
+
+
+1. Overall conclusion
+NeuroNav is a research project developed across multiple branches, each focusing on different components.
+
+The project has progressed roughly through:
+Early NeuroNav
+      │
+      ▼
+PDDL / Task Planning
+      │
+      ▼
+Hydra + Frontier Exploration
+      │
+      ▼
+Scene Graph → Task Planning
+      │
+      ▼
+Open-Vocabulary Perception
+      │
+      ▼
+Evidence-Based Planning
+      │
+      ▼
+Habitat Navigation + Verification
+      │
+      ▼
+Predicate-Guided Exploration
+      │
+      ▼
+Your Benchmark Integration
+
+Important: This is a conceptual development sequence based on branch purposes and dates, not a verified Git ancestry. Codex discovered that the repository is a shallow clone, so it cannot reconstruct the exact branching and merging history.    Pasted text
+
+
+| Missing component | Your responsibility? |
+|---|---|
+| GOAT official dataset parser | ✅ |
+| SOON official dataset parser | ✅ |
+| Unified JSONL/CSV extraction | ✅ |
+| GOAT episode initialization | ✅ |
+| GOAT sequential-task handling at the benchmark interface | ✅ |
+| SOON MatterSim integration | ✅ |
+| Simulator → Hydra observation interface | ✅ |
+| Planner → simulator action interface | ✅ |
+| Official evaluation adapters | ✅ |
+| Natural language → general predicates | ❌ Qibin/team |
+| Predicate utility improvements | ❌ Qibin/team |
+
+
+
+
+1. NeuroNav Development Flow — How the Project Grew
+Based on Codex's branch audit, NeuroNav has evolved from basic task planning and mapping into a task-predicate-guided active exploration system.
+
+The following is the conceptual development flow, reconstructed from branch purposes, commit dates, and implementation reports. It is not a verified Git merge history because your local repository is a shallow clone.    Pasted text
+Overall development diagram
+                     NeuroNav
+                        │
+                        ▼
+              [1] Environment Setup
+                     main
+                   Mar 2026
+                        │
+                        ▼
+              [2] Task Planning
+              vln-pddl-parser
+                   Apr 2026
+                        │
+                        ▼
+              [3] Active Exploration
+              frontier-exploration
+                   Apr 2026
+                        │
+                        ▼
+              [4] Mapping → Planning
+                 hydra-handoff
+                   May 2026
+                        │
+                        ▼
+              [5] Semantic Perception
+                  openset_clip
+                   Jun 2026
+                        │
+                        ▼
+              [6] Evidence & Perception
+                  CEDN / FastSAM
+                   Jul 2026
+                        │
+                        ▼
+              [7] System Integration
+                   merge_space
+                   Jul 2026
+                        │
+                ┌───────┴────────┐
+                ▼                ▼
+        [8] EvidencePDDL    [9] habitatmesh
+             Aug 2026           Aug 2026
+                │                │
+                │                │
+                └───────┬────────┘
+                        ▼
+            [10] Predicate-Guided
+                   Exploration
+                 predicate-guide
+                    Oct 2026
+                        │
+                        ▼
+             [11] Benchmark Integration
+              feature/benchmark-integration
+                     YOUR WORK
+
+The arrows indicate how the research capabilities developed conceptually, not proven parent-child relationships between branches.
+What each stage contributed
+Stage	Branch	Main development	What problem it addressed
+1	main	Environment/Docker setup	Establish the development environment
+2	vln-pddl-parser	Scene graph → PDDL	Convert environmental knowledge into symbolic planning problems
+3	frontier-exploration	Habitat + Hydra + frontiers	Allow the robot to explore an unknown environment
+4	hydra-handoff	Scene graph snapshots + task executive	Connect mapping information to task planning
+5	openset_clip	CLIP/open-vocabulary perception	Recognize objects beyond a fixed category set
+6	CEDN / FastSAM	Detection, segmentation, evidence management	Improve object perception and evidence reliability
+7	merge_space	Mapping, planning, verification and execution integration	Connect previously developed subsystems
+8	EvidencePDDL	Predicate ledger + PDDL control	Plan using evidence-backed world knowledge
+9	habitatmesh	Habitat navigation, mesh/frontier execution, target verification	Improve physical navigation and verification
+10	predicate-guide	WHAT → WHERE → WHICH	Make exploration depend on unresolved task predicates
+11	Your branch	GOAT/SOON integration	Provide standardized environments and evaluation interfaces
+
+
+These stages correspond to the functionality identified in the audit.    Pasted text
+How the actual system evolved
+The most useful way to understand the project is through its changing decision-making capabilities.
+
+Early system — Explore and map
+Habitat
+   ↓
+RGB-D + Pose
+   ↓
+Hydra
+   ↓
+3D Scene Graph
+   ↓
+Frontier Exploration
+   ↓
+Robot Moves
+
+The robot could explore unknown space, but exploration was not necessarily driven by complex task requirements.
+
+Middle system — Add planning and evidence
+User Task
+    ↓
+PDDL Brain ◄──── Predicate Ledger
+    │                  ▲
+    ▼                  │
+PLAN / EXPLORE     Hydra Scene Graph
+    │                  ▲
+    ▼                  │
+Robot Execution ──► Observations
+
+Now the system could use environmental knowledge to decide whether to plan, explore, or verify.
+
+Current research — Predicate-guided exploration
+Task Requirements
+       ↓
+Predicate Belief
+       ↓
+WHAT information matters?
+       ↓
+WHERE should we search?
+       ↓
+WHICH viewpoint/action?
+       ↓
+Habitat Navigation
+       ↓
+New Observations
+       ↓
+Hydra Scene Graph
+       ↓
+Update Predicate Belief
+       ↺
+
+The predicate-guide branch has implemented and tested components of this process, but general task support and robust end-to-end performance remain unfinished.    Pasted text
+Current project status
+Component	Status
+Hydra mapping and ROS interfaces	Implemented
+Habitat simulation bridge	Implemented
+Scene graph extraction	Implemented
+PDDL and evidence management	Implemented experimentally
+Frontier exploration	Implemented
+Predicate belief and priority	Implemented for constrained tasks
+Geometric relation grounding	Implemented for constrained relations
+Online exploration/replanning	Limited experimental validation
+General natural-language predicate extraction	Incomplete
+GOAT-Bench integration	Not implemented
+SOON integration	Not implemented
+
+
+The key finding is that NeuroNav already has substantial infrastructure, but it has not yet been systematically evaluated on GOAT-Bench or SOON.    Pasted text
+
+
+
+| Stage | Branch | Main development | What problem it addressed |
+|---|---|---|---|
+| **1** | `main` | Environment/Docker setup | Establish the development environment |
+| **2** | `vln-pddl-parser` | Scene graph → PDDL | Convert environmental knowledge into symbolic planning problems |
+| **3** | `frontier-exploration` | Habitat + Hydra + frontiers | Allow the robot to explore an unknown environment |
+| **4** | `hydra-handoff` | Scene graph snapshots + task executive | Connect mapping information to task planning |
+| **5** | `openset_clip` | CLIP/open-vocabulary perception | Recognize objects beyond a fixed category set |
+| **6** | `CEDN` / `FastSAM` | Detection, segmentation, evidence management | Improve object perception and evidence reliability |
+| **7** | `merge_space` | Mapping, planning, verification and execution integration | Connect previously developed subsystems |
+| **8** | `EvidencePDDL` | Predicate ledger + PDDL control | Plan using evidence-backed world knowledge |
+| **9** | `habitatmesh` | Habitat navigation, mesh/frontier execution, target verification | Improve physical navigation and verification |
+| **10** | `predicate-guide` | WHAT → WHERE → WHICH | Make exploration depend on unresolved task predicates |
+| **11** | Your branch | GOAT/SOON integration | Provide standardized environments and evaluation interfaces |
+
+
+
+How the actual system evolved
+The most useful way to understand the project is through its changing decision-making capabilities.
+
+Early system — Explore and map
+Habitat
+   ↓
+RGB-D + Pose
+   ↓
+Hydra
+   ↓
+3D Scene Graph
+   ↓
+Frontier Exploration
+   ↓
+Robot Moves
+
+The robot could explore unknown space, but exploration was not necessarily driven by complex task requirements.
+
+Middle system — Add planning and evidence
+User Task
+    ↓
+PDDL Brain ◄──── Predicate Ledger
+    │                  ▲
+    ▼                  │
+PLAN / EXPLORE     Hydra Scene Graph
+    │                  ▲
+    ▼                  │
+Robot Execution ──► Observations
+
+Now the system could use environmental knowledge to decide whether to plan, explore, or verify.
+
+Current research — Predicate-guided exploration
+Task Requirements
+       ↓
+Predicate Belief
+       ↓
+WHAT information matters?
+       ↓
+WHERE should we search?
+       ↓
+WHICH viewpoint/action?
+       ↓
+Habitat Navigation
+       ↓
+New Observations
+       ↓
+Hydra Scene Graph
+       ↓
+Update Predicate Belief
+       ↺
+
+The predicate-guide branch has implemented and tested components of this process, but general task support and robust end-to-end performance remain unfinished.    Pasted text
+Current project status
+Component	Status
+Hydra mapping and ROS interfaces	Implemented
+Habitat simulation bridge	Implemented
+Scene graph extraction	Implemented
+PDDL and evidence management	Implemented experimentally
+Frontier exploration	Implemented
+Predicate belief and priority	Implemented for constrained tasks
+Geometric relation grounding	Implemented for constrained relations
+Online exploration/replanning	Limited experimental validation
+General natural-language predicate extraction	Incomplete
+GOAT-Bench integration	Not implemented
+SOON integration	Not implemented
+
+
+The key finding is that NeuroNav already has substantial infrastructure, but it has not yet been systematically evaluated on GOAT-Bench or SOON.    Pasted text

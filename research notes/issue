@@ -1,0 +1,338 @@
+This step is called **frontier goal projection and validation**.
+
+Its purpose is to convert a frontier detected by Hydra into a position that the robot can actually navigate to.
+
+Importantly, **this is occupancy-grid validation, not Habitat NavMesh validation**. NavMesh feasibility is checked afterward.
+
+## 1. Why do we need projection?
+
+Hydra detects frontiers in its 3D environment representation.
+
+A frontier represents the boundary between explored and unexplored space.
+
+However, its location is not necessarily a valid robot destination.
+
+For example:
+
+```text
+          Unknown space
+    ? ? ? ? ? ? ? ? ?
+    ? ? ? ? ? ? ? ? ?
+    ─── FRONTIER ─────
+       █ █ █
+       █ Wall
+       █
+    . . . . . . . . .
+    . . Robot . . . .
+    . . . . . . . . .
+         Free space
+```
+
+We cannot simply send the frontier's 3D position to the Oracle.
+
+Instead, we search for a nearby traversable position.
+
+---
+
+## 2. How does our current projection algorithm work?
+
+According to the earlier Stage 4E code audit, our implementation uses:
+
+`nearest_reachable_free_cell_v1`
+
+The process is approximately:
+
+### Step 1 — Obtain the occupancy grid
+
+The system receives Hydra's occupancy information through:
+
+```text
+/hydra/gvd/occupancy
+       ↓
+      /map
+```
+
+Each cell represents the occupancy state of a small region.
+
+Typical occupancy-grid values are:
+
+| Value | Meaning |
+|---|---|
+| 0 | Free |
+| 1–100 | Increasing occupancy cost |
+| -1 | Unknown |
+
+The exact interpretation depends on the occupancy publisher.
+
+### Step 2 — Find robot-connected free space
+
+The algorithm starts from the robot's position and identifies the connected traversable component.
+
+Conceptually:
+
+```text
+Robot
+  ↓
+Find nearby traversable cells
+  ↓
+Flood fill / graph traversal
+  ↓
+Identify robot-connected region
+```
+
+This prevents selecting cells that appear free but are disconnected from the robot.
+
+For example:
+
+```text
+Free region A       Wall       Free region B
+
+. . . R . .        ███        . . . . .
+. . . . . .        ███        . . F . .
+. . . . . .        ███        . . . . .
+```
+
+The frontier near region B may be rejected because the occupancy map does not contain a traversable connection from the robot.
+
+### Step 3 — Search near the frontier
+
+For each frontier anchor, the projector searches nearby occupancy-grid cells.
+
+The earlier configuration used:
+
+\[
+r_{\text{projection}}=2.0\text{ m}
+\]
+
+Only cells within approximately 2 m of the anchor are considered.
+
+This is a search radius, not the maximum navigation distance from the robot.
+
+### Step 4 — Filter invalid cells
+
+A candidate can be rejected if it violates the projection requirements.
+
+Based on the previously reported configuration:
+
+| Constraint | Earlier value | Purpose |
+|---|---:|---|
+| Projection radius | 2.0 m | Keep projected goals near the frontier |
+| Free occupancy threshold | 25 | Identify sufficiently free cells |
+| Boundary margin | 0.6 m | Avoid cells too close to obstacles/boundaries |
+| Preferred cost maximum | 128 | Prefer lower-cost candidates |
+| Connectivity | Robot-connected component | Avoid disconnected destinations |
+
+These values come from the earlier reported Stage 4E configuration; the current installed values have not been independently rechecked.
+
+A cell that fails the required constraints cannot become a projected navigation goal.
+
+### Step 5 — Rank valid cells
+
+The earlier code audit described the ranking order as:
+
+1. Occupancy/cost preference.
+2. Distance from the frontier anchor.
+3. Distance from the frontier.
+4. Grid-cell coordinates for deterministic tie-breaking.
+
+The projector chooses the highest-ranked eligible cell.
+
+Conceptually:
+
+\[
+p_{\text{goal}}
+=
+\arg\min_{p\in C_{\text{valid}}}
+\operatorname{ProjectionCost}(p)
+\]
+
+where \(C_{\text{valid}}\) is the set of cells satisfying the projection constraints.
+
+This formula represents the selection concept; it is not necessarily the exact cost function used in the code.
+
+---
+
+## 3. What happens if no valid cell exists?
+
+The projection fails.
+
+```text
+Hydra frontier
+      ↓
+Search within 2 m
+      ↓
+Find robot-connected traversable cells
+      ↓
+Apply occupancy constraints
+      ↓
+No valid candidate
+      ↓
+Projection rejected
+```
+
+That frontier cannot proceed to the next stage.
+
+**This is what happened to 14 of 15 frontier records in the earlier `00802` run.**
+
+However, we do not yet know the individual rejection reasons for those 14 records.
+
+---
+
+## 4. What happens after projection?
+
+Even a valid occupancy-grid goal might not be valid in Habitat.
+
+Therefore, Qibin's Stage 4E pipeline performs another check:
+
+```text
+Hydra frontier
+      ↓
+Occupancy-grid projection
+      ↓
+Robot-connected free cell
+      ↓
+Previously attempted goal filtering
+      ↓
+Habitat NavMesh feasibility
+      ↓
+Predicate utility scoring
+      ↓
+Oracle navigation
+```
+
+The NavMesh check verifies that the projected goal satisfies the simulator's navigation constraints.
+
+This is why occupancy projection and NavMesh feasibility must remain separate.
+
+---
+
+## 5. Where is the implementation?
+
+The relevant files are:
+
+| File | Responsibility |
+|---|---|
+| `frontier_explorer_core.py` | Core frontier projection and connectivity helpers |
+| `frontier_explorer.py` | Frontier candidate processing and runtime integration |
+| `predicate_newstage4_habitat_replanner.py` | Stage 4E candidate handling and attempted-pose filtering |
+| `predicate_newstage4e_core.py` | Habitat NavMesh feasibility filtering |
+
+To find the exact implementation on your Ubuntu host:
+
+```bash
+cd /ssd/workspaces/NeuroNav
+
+grep -Rn \
+  'nearest_reachable_free_cell_v1\|candidate_map_poses\|project_frontier' \
+  src/neuronav_runtime/neuronav_runtime/
+```
+
+### My assessment
+
+The critical question is not simply why the robot stops.
+
+It is:
+
+**Why do so many Hydra frontiers fail to produce robot-connected occupancy-grid goals?**
+
+For the previous run:
+
+\[
+15\text{ frontiers}
+\rightarrow1\text{ projected goal}
+\rightarrow0\text{ executable goals}
+\]
+
+We should inspect the rejection reasons before changing the projection radius, occupancy thresholds, or connectivity rules.
+
+Otherwise, we risk allowing the robot to navigate toward invalid or unreachable locations.
+
+
+
+**If a Hydra frontier cannot be projected onto the occupancy grid, the failure occurs in the frontier projection stage—not in the Oracle or predicate scorer.**
+
+However, the underlying cause could come from **Hydra's map, the projection algorithm, or the interaction between them**.
+
+### 1. Which component is responsible?
+
+Our pipeline is:
+
+```text
+Habitat RGB-D observations
+          ↓
+Hydra 3D mapping
+          ↓
+Hydra frontier detection
+          ↓
+Occupancy grid (/map)
+          ↓
+Frontier projection   ← FAILURE OCCURS HERE
+          ↓
+NavMesh feasibility
+          ↓
+Predicate scoring
+          ↓
+Oracle navigation
+```
+
+There are three main possibilities:
+
+| Possible cause | Responsible component | Explanation |
+|---|---|---|
+| **A. Incorrect/incomplete occupancy map** | Hydra / occupancy relay | The grid does not represent traversable space accurately |
+| **B. Projection algorithm too restrictive** | `frontier_explorer_core.py` / `frontier_explorer.py` | Valid frontiers cannot find acceptable nearby grid cells |
+| **C. Frontier and occupancy map mismatch** | Hydra → frontier integration | Frontier coordinates and occupancy-grid coordinates may not align correctly |
+
+### 2. Which is most likely?
+
+Based on our previous experiments, I would investigate **the occupancy map and projection constraints first**.
+
+Why?
+
+In the earlier `00802` run:
+
+```text
+Hydra detected:             15 frontiers
+Successfully projected:      1
+Rejected during projection: 14
+```
+
+That is a **93.3% projection rejection rate**.
+
+But this alone does not prove that the projection algorithm is defective.
+
+For example, Hydra might detect frontiers in regions that genuinely lack reachable free-space cells.
+
+Alternatively, the occupancy map might be incomplete or incorrectly aligned.
+
+### 3. Which files should we inspect?
+
+| File | What to inspect |
+|---|---|
+| `frontier_explorer_core.py` | Connectivity, projection radius, occupancy thresholds |
+| `frontier_explorer.py` | Frontier anchor coordinates and projection requests |
+| `occupancy_relay.py` | Conversion from Hydra occupancy to `/map` |
+| `predicate_newstage4_habitat_replanner.py` | Candidate rejection diagnostics |
+| Hydra configuration YAML | Occupancy generation and frontier settings |
+
+**We should not modify `predicate_utility_core.py` or the Oracle controller for this issue.** Those components operate after projection.
+
+### 4. What should Codex determine?
+
+For each of the 14 rejected frontiers, we need to know:
+
+- Was its anchor inside the occupancy-grid bounds?
+- Was it in the correct coordinate frame?
+- Were there free cells within the 2 m search radius?
+- Were those cells connected to the robot's traversable component?
+- Which exact projection constraint rejected it?
+
+This would tell us whether the problem comes from Hydra's map or from our projection policy.
+
+### Conclusion
+
+**The immediate failure is in frontier projection, but we have not established whether Hydra's map or the projector is responsible.**
+
+My recommendation is to inspect the 14 rejected frontiers individually before changing any parameters.
+
+If they are genuinely unreachable, rejection is correct. If reachable cells exist but the projector rejects them, we have identified a projection or integration problem.

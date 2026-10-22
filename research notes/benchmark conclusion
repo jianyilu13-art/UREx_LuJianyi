@@ -1,0 +1,793 @@
+# NeuroNav Benchmark Integration — Work Summary
+**Date:** 22 October 2026  
+**Project:** NeuroNav — LangMap/HM3D Benchmark Integration  
+**Status:** ✅ End-to-end benchmark pipeline validated
+
+## 1. Project Objective
+
+Our objective was to integrate **NeuroNav with the official LangMap benchmark using Habitat-Sim**, establishing a reproducible evaluation pipeline for future exploration and predicate-guided navigation research.
+
+The benchmark must support:
+
+- Loading official LangMap episodes into Habitat.
+- Initializing the robot at the official starting position and orientation.
+- Building an environment representation using Hydra.
+- Generating and selecting feasible frontier navigation goals.
+- Executing navigation using the team's Habitat Oracle controller.
+- Recording robot trajectories and exploration progress.
+- Evaluating navigation performance using official LangMap criteria.
+- Generating per-episode and aggregate evaluation reports.
+
+**Our contribution is benchmark integration and evaluation infrastructure, not a new exploration algorithm.**
+
+---
+
+## 2. Final System Architecture
+
+We successfully established the following pipeline:
+
+```text
+             LangMap Benchmark
+           (Episode + Ground Truth)
+                     │
+          ┌──────────┴──────────┐
+          │                     │
+          ▼                     ▼
+     Episode Loader       Private Evaluator
+          │                     ▲
+          ▼                     │
+      Habitat-Sim                │
+          │                     │
+          ▼                     │
+    RGB-D Observations          │
+          │                     │
+          ▼                     │
+       Hydra SLAM               │
+          │                     │
+          ▼                     │
+    Dynamic Scene Graph         │
+          │                     │
+          ▼                     │
+    Frontier Candidates         │
+          │                     │
+          ▼                     │
+  NavMesh Feasibility Filter    │
+          │                     │
+          ▼                     │
+  Qibin's Stage 4E Scoring      │
+    (Placeholder Predicates)    │
+          │                     │
+          ▼                     │
+      Goal Selection            │
+          │                     │
+          ▼                     │
+      Habitat Oracle            │
+          │                     │
+          ▼                     │
+      Robot Movement            │
+          │                     │
+          ▼                     │
+     Trajectory Recorder ───────┘
+                                │
+                                ▼
+                        SR / SPL / Report
+```
+
+The ground-truth target information is reserved for evaluation and is not used by the exploration policy.
+
+---
+
+## 3. Major Problems Encountered and Solutions
+
+| Problem | Root cause | Solution | Status |
+|---|---|---|---|
+| Frontier explorer initially disabled | Manual activation required | Integrated automatic benchmark startup | ✅ |
+| Oracle rejected frontier goals | Selected occupancy-grid goals were not necessarily NavMesh-feasible | Reused Qibin's Stage 4E batch feasibility filtering | ✅ |
+| Robot failed to navigate | Earlier custom frontier-to-Oracle integration was incomplete | Switched to Qibin's existing Stage 4E pipeline | ✅ |
+| Robot stopped after several goals | Original six-request predicate-binding budget | Added standalone-only budget bypass | ✅ |
+| Oracle navigation timeouts | HM3D paths were longer than those in Qibin's MP3D experiments | Investigated and retained explicit timeout accounting | ⚠️ Some timeouts remain |
+| Hydra TF extrapolation errors | Intermittent sensor/TF timing mismatch | Confirmed they were not responsible for the six-request termination | ⚠️ Intermittent |
+| Missing evaluation outputs | Previous reporting tool did not provide a complete evaluation workflow | Integrated trajectory recording, evaluator, and reporting | ✅ |
+
+### Important discovery
+
+The repeated robot-stopping problem was **not caused by HM3D incompatibility, Hydra mapping failure, or TF errors**.
+
+The actual cause was:
+
+```text
+first_binding_budget_exhausted
+```
+
+Qibin's original system limits the first predicate-binding stage to six navigation requests.
+
+Because our standalone benchmark intentionally uses unbindable placeholder predicates, that condition could never be satisfied.
+
+We implemented a benchmark-specific bypass while preserving the original predicate-task behavior.
+
+---
+
+## 4. Exploration and Navigation
+
+We retained Qibin's existing Stage 4E implementation.
+
+### Exploration
+
+The robot:
+
+1. Builds an initial map through a four-segment startup scan.
+2. Extracts frontier candidates from Hydra's environment representation.
+3. Projects candidate navigation goals.
+4. Filters candidates using Habitat NavMesh feasibility queries.
+5. Scores the feasible candidates using Qibin's existing predicate utility scorer.
+6. Selects an exploration goal.
+7. Navigates using Habitat Oracle.
+8. Updates Hydra and repeats.
+
+### Navigation
+
+The system uses the team's existing:
+
+- Habitat `PathFinder`.
+- `ShortestPath`.
+- `GreedyGeodesicFollower`.
+- Discrete movement actions.
+- NavMesh collision and feasibility constraints.
+
+We did not modify these controller algorithms.
+
+**The current placeholder predicates are intentional.** They allow us to validate the benchmark infrastructure before the team's updated predicate reasoning is integrated.
+
+---
+
+## 5. Benchmark Evaluation
+
+We implemented and tested the evaluation pipeline against the LangMap protocol identified by Codex.
+
+### Success Rate
+
+An episode is successful when the final robot position is within the official success region.
+
+The reported LangMap criterion is:
+
+\[
+d_{\text{geo}}(p_{\text{final}},V_{\text{target}})<0.25\text{ m}
+\]
+
+where \(V_{\text{target}}\) represents valid target viewpoints.
+
+Aggregate Success Rate is:
+
+\[
+\boxed{SR=\frac{\text{Successful episodes}}{\text{Total episodes}}}
+\]
+
+### Success weighted by Path Length
+
+\[
+\boxed{
+SPL=\frac{1}{N}\sum_{i=1}^{N}
+S_i\frac{L_i}{\max(L_i,P_i)}
+}
+\]
+
+where:
+
+- \(S_i\): Episode success indicator.
+- \(L_i\): Shortest geodesic reference path.
+- \(P_i\): Actual traveled distance.
+
+The evaluator also records navigation outcomes, action counts, target proximity, and termination reasons.
+
+---
+
+## 6. Real HM3D Experiment Results
+
+We completed an end-to-end LangMap episode:
+
+**Episode:** `00800-TEEsavR23oF_instance_0`
+
+### Navigation and mapping
+
+| Metric | Result |
+|---|---:|
+| Official start position | `[-4.03902, 3.11338, -0.06032]` |
+| Navigation requests | 11 |
+| Successful Oracle requests | 8 |
+| Failed/cancelled requests | 3 |
+| Oracle timeouts | 2 |
+| Executed actions | 500 |
+| Actual traveled distance | 26.408 m |
+| Hydra graph revision | 22 → 39 |
+| Termination reason | `benchmark_action_limit_reached` |
+
+### LangMap evaluation
+
+| Metric | Result |
+|---|---:|
+| Shortest reference path | 8.387 m |
+| Final target geodesic distance | 0.561 m |
+| Minimum target distance during exploration | **0.098 m** |
+| Success | False |
+| SR (one episode) | 0% |
+| SPL | 0.0 |
+
+### Interpretation
+
+The robot successfully explored the environment and passed within:
+
+\[
+d_{\min}=0.098\text{ m}
+\]
+
+of a valid target viewpoint.
+
+However, its final position was:
+
+\[
+d_{\text{final}}=0.561\text{ m}
+\]
+
+Therefore, it failed the official terminal-position success criterion.
+
+**This is an important validation result: the evaluator distinguishes passing through the target region from successfully terminating inside it.**
+
+The result also demonstrates why future target-aware reasoning and stopping decisions matter.
+
+---
+
+## 7. Code Changes
+
+### Official NeuroNav runtime
+
+We retained necessary integration changes in:
+
+| File | Purpose |
+|---|---|
+| `habitat_worker.py` | Official episode pose initialization and validation |
+| `habitat_live_bridge.py` | Starting-pose forwarding and trajectory recording |
+| `mp3d_frontier_explore_light.launch.py` | Benchmark-specific launch configuration |
+| `predicate_newstage4_habitat_replanner.py` | Standalone exploration lifecycle and benchmark-only budget bypass |
+
+Qibin's frontier scoring, NavMesh feasibility, and Oracle controller algorithms were preserved.
+
+### Benchmark infrastructure
+
+The benchmark tools now provide:
+
+| File | Function |
+|---|---|
+| `prepare_episode.py` | Episode preparation |
+| `launch_episode.py` | Benchmark execution |
+| `record_episode.py` | Recording integration |
+| `evaluation_core.py` | Evaluation calculations |
+| `evaluate.py` | Per-episode evaluation |
+| `report.py` | Report generation |
+
+Obsolete frontier auto-enable helpers were removed after the Stage 4E integration replaced their earlier role.
+
+---
+
+## 8. Generated Evaluation Artifacts
+
+The completed experiment produced:
+
+```text
+benchmark_results/
+│
+├── 00800-TEEsavR23oF_instance_0/
+│   ├── episode.json
+│   ├── trajectory.csv
+│   ├── navigation_events.jsonl
+│   ├── hydra_summary.json
+│   ├── episode_run.json
+│   ├── evaluation.json
+│   ├── report.json
+│   └── report.md
+│
+└── aggregate/
+    ├── metrics.json
+    └── report.md
+```
+
+These provide a reusable foundation for evaluating additional episodes.
+
+---
+
+## 9. Verification
+
+Codex reported the following completed checks:
+
+| Verification | Result |
+|---|---|
+| Benchmark/evaluator tests | 15 passed |
+| Stage 4E and Oracle regression tests | 82 passed |
+| Official starting pose | Preserved |
+| Navigation beyond six requests | Verified — 11 requests |
+| Real Habitat movement | Verified |
+| Hydra DSG updates | Verified |
+| Trajectory recording | Verified |
+| Per-episode evaluation | Verified |
+| Aggregate report generation | Verified |
+| ROS processes after testing | Cleaned up |
+
+One important limitation remains: the Oracle's 0.1 m forward steps and 10° turns differ from LangMap's native action granularity. Therefore, the current 500-action limit is a documented adaptation, not a completely identical native LangMap execution protocol.
+
+---
+
+## 10. Current Status and Future Work
+
+### Completed
+
+✅ LangMap episode loading  
+✅ Habitat integration  
+✅ Official start-pose support  
+✅ Hydra mapping  
+✅ Frontier generation and feasibility filtering  
+✅ Qibin Stage 4E integration  
+✅ Habitat Oracle navigation  
+✅ Benchmark-only termination handling  
+✅ Trajectory recording  
+✅ Success/SPL evaluation  
+✅ Automatic report generation  
+✅ One real end-to-end HM3D experiment  
+
+### Next steps
+
+**1. Multi-episode validation**
+
+Run a small batch across different scenes, starting poses, and target objects to verify reproducibility and aggregate SR/SPL.
+
+**2. Team predicate integration**
+
+When teammates release their updated predicate logic, replace the placeholder task configuration with real task grounding while retaining the benchmark infrastructure.
+
+**3. Comparative experiments**
+
+Use identical episodes and evaluation rules to compare the current exploration baseline against the future predicate-guided system.
+
+**4. Protocol consistency**
+
+Document or address differences between the Oracle's action space and LangMap's native execution settings before claiming directly comparable official benchmark scores.
+
+---
+
+## Final Conclusion
+
+**We successfully developed and validated an end-to-end LangMap/HM3D benchmark integration for NeuroNav.**
+
+The system can now load official episodes, initialize Habitat at the correct pose, construct Hydra scene graphs, execute frontier exploration using Qibin's Stage 4E pipeline and Habitat Oracle, record actual robot trajectories, and compute Success Rate and SPL.
+
+We also resolved two major integration issues: NavMesh-incompatible frontier selection and premature exploration termination caused by the predicate-binding request budget.
+
+The completed 500-action HM3D experiment demonstrated sustained exploration, real robot movement, continuous mapping progress, and functioning evaluation/report generation.
+
+**The main contribution is a reusable benchmark and evaluation framework that allows the team's future predicate-guided exploration algorithms to be tested quantitatively without rebuilding the simulation and evaluation pipeline.**
+
+
+
+# NeuroNav Benchmark — Bug Summary and Remaining Issues
+
+**Project:** NeuroNav + LangMap/HM3D Benchmark Integration  
+**Status:** Core simulation and navigation working; benchmark reliability issues remain.  
+**Based on:** Our debugging history and Codex's latest reliability audit.
+
+## 1. Summary of all bugs encountered
+
+| # | Problem | Root cause / possible source | Status |
+|---|---|---|---|
+| 1 | Frontier explorer required manual activation | `frontier_explorer.py` activation lifecycle | ✅ Resolved for benchmark |
+| 2 | Frontier goals rejected by Oracle | Occupancy-grid projections did not always align with Habitat NavMesh | ✅ Resolved through Stage 4E filtering |
+| 3 | Earlier frontier algorithm selected one goal before feasibility checking | Custom integration in `frontier_explorer.py` differed from Qibin's Stage 4E pipeline | ✅ Replaced |
+| 4 | Oracle integration caused runtime errors | Unsupported status arguments in modified `frontier_explorer.py` | ✅ Fixed |
+| 5 | Robot stopped after six navigation requests | Predicate-binding request budget inherited by standalone mode | ✅ Fixed for benchmark |
+| 6 | Robot stopped after five navigation cycles | `new_snapshot_or_identity_wait_timeout` | ❌ Remaining |
+| 7 | Robot stopped after 16 navigation cycles | `scorer_rejected:no_executable_actions` | ⚠️ Needs benchmark-specific handling |
+| 8 | TF timestamp extrapolation warnings | Habitat sensor/TF synchronization | ⚠️ Remaining |
+| 9 | ROS node discovery appeared inconsistent | ROS CLI discovery/daemon behavior | 🟡 No runtime DDS failure confirmed |
+| 10 | Robot stopped but RViz continued running | Standalone terminal state did not shut down ROS launch | ❌ Remaining |
+| 11 | Codex reported 500 executed actions, but only 492 occurred | STOP events counted as executed actions | ❌ Remaining |
+| 12 | Different runs produced different results | Different Hydra startup states and asynchronous observations | ❌ Reproducibility issue |
+| 13 | Evaluation/report generation not automatic | `launch_episode.py` only launches and waits | ❌ Remaining |
+| 14 | Benchmark results saved under Docker `/tmp` | Temporary evidence-root configuration | ⚠️ Persistence improvement needed |
+
+---
+
+# 2. Remaining Bug A — Hydra snapshot timeout
+
+**Priority: HIGH**
+
+### Error
+
+```text
+FAILED: new_snapshot_or_identity_wait_timeout
+```
+
+### Confirmed cause
+
+Codex reconstructed the following sequence:
+
+```text
+Hydra graph revision 24
+         ↓
+Stage 4E selects a frontier
+         ↓
+Oracle begins navigation
+         ↓
+Hydra updates to revision 25
+         ↓
+Oracle navigation succeeds
+         ↓
+Stage 4E sets revision 25 as watermark
+         ↓
+Stage 4E requires revision 26
+         ↓
+Hydra remains at revision 25
+         ↓
+15-second timeout
+         ↓
+FAILED
+```
+
+The replanner received a new graph during navigation but required another update after navigation.
+
+**This is a snapshot-revision timeout, not an entity-identity timeout.** Pasted text
+
+### Source files
+
+| File | Relevant part |
+|---|---|
+| `predicate_newstage4_core.py` | Snapshot watermark selection, around line 995 |
+| `predicate_newstage4_core.py` | Mandatory next-revision requirement, around line 528 |
+| `predicate_newstage4_core.py` | Snapshot waiting timeout, around line 1065 |
+| `predicate_newstage4_habitat_replanner.py` | Runtime observe–replan coordination |
+
+### Code ownership
+
+**Original team Stage 4E behavior**, exposed by our standalone benchmark.
+
+### Suggested fix
+
+Introduce a benchmark-only freshness policy that can recognize a valid mapping update received during movement, while preserving the necessary post-navigation observation guarantees.
+
+Do not globally remove snapshot validation.
+
+---
+
+# 3. Remaining Bug B — No executable frontier actions
+
+**Priority: HIGH**
+
+### Error
+
+```text
+FAILED: scorer_rejected:no_executable_actions
+```
+
+### Confirmed cause
+
+In the second manual run, at Hydra revision 38:
+
+| Stage | Candidates |
+|---|---:|
+| Hydra frontier records | 15 |
+| Rejected by occupancy projection | 14 |
+| Remaining projected candidate | 1 |
+| Rejected as previously attempted | 1 |
+| Executable candidates | **0** |
+
+The scorer received an empty executable set and returned `no_executable_actions`. Pasted text
+
+### Source files
+
+| File | Relevant part |
+|---|---|
+| `frontier_explorer.py` | Frontier projection and candidate generation |
+| `predicate_newstage4_habitat_replanner.py` | Cross-snapshot attempted-pose filtering, around line 448 |
+| `predicate_newstage4e_core.py` | NavMesh feasibility filtering |
+| `predicate_utility_core.py` | Scorer rejection, around line 357 |
+| `predicate_newstage4_core.py` | Coordinator terminal-state handling |
+
+### Code ownership
+
+Candidate filtering and scoring are **Qibin's original algorithms**.
+
+The benchmark-specific problem is that standalone exploration treats this result as a fatal predicate-task failure.
+
+### Suggested fix
+
+For standalone benchmark mode:
+
+- Distinguish genuine frontier exhaustion from temporary candidate unavailability.
+- Record a clear termination reason such as `frontier_exhausted` when exhaustion is established.
+- Preserve the original predicate-task failure behavior.
+- Do not change the scorer or silently re-enable previously rejected candidates.
+
+**Important:** We have not proven that the entire environment was explored. We only know that no executable candidate remained under the current selection policy.
+
+---
+
+# 4. Remaining Bug C — TF timestamp synchronization
+
+**Priority: MEDIUM**
+
+### Error
+
+```text
+Failed to find world_T_base_link_gt
+Lookup would require extrapolation into the future
+Hydra Input dropping input due to missing pose
+```
+
+### Observations
+
+| Experiment | Observed Hydra pose drops |
+|---|---:|
+| Codex's previous run | 0 |
+| Manual run 1 | 23 |
+| Manual run 2 | 12 |
+
+The timestamp mismatches were typically 0.1–0.5 seconds. Pasted text
+
+### Possible source files
+
+| File | Relevant part |
+|---|---|
+| `habitat_live_bridge.py` | Sensor, odometry, TF and `/clock` publication |
+| `habitat_worker.py` | Habitat observation generation |
+| Hydra input pipeline | Sensor pose lookup and frame synchronization |
+| `mp3d_frontier_explore_light.launch.py` | TF and sensor timing configuration |
+
+### Likely mechanism
+
+```text
+Habitat generates observation
+          ↓
+Sensor message published
+          ↓
+Hydra requests TF at sensor timestamp
+          ↓
+Required transform not yet available
+          ↓
+Hydra drops observation
+```
+
+### Current conclusion
+
+These errors are real, but **Codex did not find evidence that they directly caused either observed terminal failure**.
+
+They remain a reproducibility concern.
+
+We should investigate publication ordering and timing separately rather than changing TF timestamps without evidence.
+
+---
+
+# 5. Remaining Bug D — Simulation does not automatically exit
+
+**Priority: HIGH**
+
+### Problem
+
+After the Stage 4E replanner terminates, Habitat, Hydra, and RViz may continue running.
+
+The robot becomes stationary, making the experiment appear frozen.
+
+### Source files
+
+**`predicate_newstage4_habitat_replanner.py`**
+
+Around line 856, automatic shutdown is configured for online relation runs but not standalone benchmark termination.
+
+**`benchmark_tools/runtime/launch_episode.py`**
+
+Around line 57:
+
+```python
+launch = subprocess.Popen(command)
+
+try:
+    return launch.wait()
+except KeyboardInterrupt:
+    launch.terminate()
+    return launch.wait()
+```
+
+The launcher waits for the ROS launch process to exit.
+
+It does not independently detect the replanner's terminal state.
+
+Codex confirmed that one manual simulation remained running for approximately ten minutes after the replanner had already terminated. Pasted text
+
+### Suggested fix
+
+Add a benchmark-only supervisor:
+
+```text
+Stage 4E terminal state
+          ↓
+Finalize runtime evidence
+          ↓
+Gracefully stop ROS launch
+          ↓
+Finalize trajectory
+          ↓
+Evaluate episode
+          ↓
+Generate report
+```
+
+This should work for both successful and failed benchmark runs.
+
+---
+
+# 6. Remaining Bug E — Incorrect Habitat action counting
+
+**Priority: HIGH for evaluation correctness**
+
+### Problem
+
+Codex previously reported:
+
+```text
+500 Habitat actions executed
+```
+
+However, the audit found:
+
+```text
+500 controller action events
+492 actual Habitat sim.step() actions
+8 STOP decisions
+```
+
+The eight STOP events did not execute simulator movement steps. Pasted text
+
+### Source files
+
+| File | Relevant part |
+|---|---|
+| `habitat_worker.py` | STOP-event generation, around line 702 |
+| `predicate_newstage4_habitat_replanner.py` | Action counting, around line 934 |
+| `benchmark_tools/runtime/record_episode.py` | Recorded action-count calculation |
+
+### Suggested fix
+
+Track distinct counters:
+
+```text
+controller_action_events
+executed_simulator_actions
+stop_decisions
+```
+
+Use the action definition required by the verified benchmark protocol when enforcing the episode budget.
+
+Preserve the original controller's behavior.
+
+---
+
+# 7. Remaining Issue F — Reproducibility
+
+**Priority: HIGH**
+
+### Problem
+
+Codex's run and our manual runs produced different exploration trajectories, despite using comparable configurations.
+
+The audit found that the runs began with different Hydra mapping states.
+
+| Configuration | Codex run | Manual run |
+|---|---|---|
+| Startup Hydra revision | ~21 | ~16 |
+| RViz | Disabled | Two processes |
+| TF drops | 0 | 23 |
+| Configured time limit | 360 s | 600 s |
+
+Different initial graph states produced different frontier selections. Pasted text
+
+### Possible source files
+
+| File | Relevant part |
+|---|---|
+| `mp3d_frontier_explore_light.launch.py` | Startup configuration |
+| `frontier_startup_primer.py` or equivalent | Startup scan and readiness logic |
+| `predicate_newstage4_habitat_replanner.py` | Initial snapshot acceptance |
+| `benchmark_tools/runtime/launch_episode.py` | Benchmark launch arguments |
+
+The exact primer implementation filename should be confirmed from the repository.
+
+### Suggested fix
+
+For controlled experiments:
+
+- Use identical launch parameters.
+- Disable RViz during benchmark reliability tests.
+- Verify comparable startup scan completion.
+- Record the initial Hydra revision and candidate set.
+- Save the exact Git state, launch command, Docker image ID and ROS environment.
+
+Do not assume that matching random seeds guarantees identical asynchronous Hydra mapping states.
+
+---
+
+# 8. Remaining Issue G — Automatic evaluation and reporting
+
+**Priority: MEDIUM**
+
+### Problem
+
+Our evaluator and report generator work when invoked as part of the completed evaluation workflow.
+
+However, the `launch_episode.py` source you provided only starts the simulation and waits.
+
+It does not automatically call:
+
+```text
+evaluate.py
+report.py
+```
+
+### Source files
+
+| File | Responsibility |
+|---|---|
+| `benchmark_tools/runtime/launch_episode.py` | Simulation launch |
+| `benchmark_tools/runtime/record_episode.py` | Recording |
+| `benchmark_tools/runtime/evaluate.py` | Evaluation |
+| `benchmark_tools/runtime/evaluation_core.py` | SR/SPL formulas |
+| `benchmark_tools/runtime/report.py` | Report generation |
+
+### Suggested fix
+
+Connect normal benchmark termination to automatic evaluation and reporting.
+
+Also support interrupted runs by saving available evidence and marking them incomplete rather than silently including them in official SR/SPL.
+
+---
+
+# 9. Previously resolved problems
+
+These issues no longer appear to be the main blockers.
+
+| Problem | Resolution |
+|---|---|
+| Manual frontier activation | Benchmark startup integration |
+| `goal_snap_exceeded` for all selected goals | Qibin's batch NavMesh feasibility filtering |
+| Select-one-then-check candidate pipeline | Replaced with original Stage 4E pipeline |
+| Oracle status argument crash | Removed unsupported status arguments |
+| Six-request termination | Standalone-only predicate-budget bypass |
+| Official LangMap start-pose mismatch | Official pose forwarding and validation |
+| Missing trajectory recording | Added ground-truth trajectory recording |
+| Missing SR/SPL calculations | Implemented evaluation pipeline |
+
+The resolved status applies to the tested configurations; it does not guarantee that every future episode will behave identically.
+
+---
+
+# 10. Which files should we focus on?
+
+Rather than modifying every component, I would prioritize these files:
+
+| File | Priority | Why |
+|---|---|---|
+| `predicate_newstage4_habitat_replanner.py` | 🔴 High | Standalone lifecycle, candidate exhaustion, shutdown, action counting |
+| `predicate_newstage4_core.py` | 🔴 High — inspect only initially | Snapshot freshness contract |
+| `benchmark_tools/runtime/launch_episode.py` | 🔴 High | Automatic termination, reproducibility, evaluation orchestration |
+| `benchmark_tools/runtime/record_episode.py` | 🔴 High | Correct simulator-action counting |
+| `habitat_live_bridge.py` | 🟡 Medium | TF/sensor synchronization |
+| `mp3d_frontier_explore_light.launch.py` | 🟡 Medium | Startup readiness and benchmark configuration |
+| `predicate_utility_core.py` | 🟢 Low — inspect only | Confirmed empty-set rejection; scorer itself is not proven defective |
+| `habitat_worker.py` | 🟢 Low — inspect only | Oracle works; action-event semantics need accounting clarification |
+
+## Final assessment
+
+**The remaining problems are concentrated in benchmark lifecycle handling, snapshot synchronization, termination classification, action accounting, and reproducibility—not in the fundamental ability of Hydra and Habitat Oracle to navigate.**
+
+The two most important runtime failures are:
+
+1. **`new_snapshot_or_identity_wait_timeout`** — The replanner requires another Hydra revision even when a new revision was already received during navigation.
+2. **`scorer_rejected:no_executable_actions`** — No eligible frontier remains, but standalone mode classifies the condition as a fatal predicate-task failure.
+
+Our priority should be to fix these issues **only for standalone benchmark testing**, preserve Qibin's original predicate-task behavior, and then validate the fixes through repeated controlled HM3D runs.
+
+The next milestone is not simply reaching 500 actions. It is **ensuring every benchmark run either completes under a valid termination condition or reports a genuine, diagnosable runtime failure, with trustworthy evaluation artifacts.**

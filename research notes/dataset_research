@@ -1,0 +1,25 @@
+/ssd/datasets/goat-bench/
+
+File	Purpose
+train/train.json.gz	Main training dataset index
+train/content/<scene>.json.gz	Scene-specific training episodes
+val_seen/val_seen.json.gz	Seen-category validation index
+val_seen/content/<scene>.json.gz	Scene-specific validation episodes
+val_seen/goat_language_goals.json	Language-goal metadata
+val_seen/goat_object_goals.json	Object-goal metadata
+val_seen_synonyms/	Validation with unseen synonyms
+val_unseen/	Validation with unseen object categories
+
+
+The presence of these files is confirmed by your directory listing. Their exact internal JSON schemas still need inspection.    Pasted text
+
+| File | Purpose |
+|---|---|
+| `train/train.json.gz` | Main training dataset index |
+| `train/content/<scene>.json.gz` | Scene-specific training episodes |
+| `val_seen/val_seen.json.gz` | Seen-category validation index |
+| `val_seen/content/<scene>.json.gz` | Scene-specific validation episodes |
+| `val_seen/goat_language_goals.json` | Language-goal metadata |
+| `val_seen/goat_object_goals.json` | Object-goal metadata |
+| `val_seen_synonyms/` | Validation with unseen synonyms |
+| `val_unseen/` | Validation with unseen object categories |
